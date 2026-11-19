@@ -61,11 +61,14 @@ PAGE = """<!doctype html>
   <label><input type="radio" name="mode" value="timeout"> 超时（不应答）</label>
   <p>
     A 记录 IP：<input type="text" id="ip" value="192.0.2.10">
+    &nbsp; 发布序号：<input type="number" id="serial" value="1" min="1" step="1">
     &nbsp; 延迟秒数：<input type="number" id="delay" value="3" min="0" step="0.5">
     &nbsp; <button onclick="applyMode()">应用</button>
     <span id="modemsg"></span>
   </p>
   <p class="muted">当前权威端模式：<b id="curmode">…</b>（每 2 秒自动刷新）</p>
+  <p class="muted">模拟副本可在 <b>A 记录</b> 与 <b>NXDOMAIN</b> 间切换，
+    用发布序号区分新旧：把序号改小即模拟落后副本，改大即模拟重新发布。</p>
 </section>
 
 <section>
@@ -77,7 +80,7 @@ PAGE = """<!doctype html>
 </section>
 
 <section>
-  <h2>3. 解析器缓存状态</h2>
+  <h2>3. 解析器缓存状态（含已接受序号）</h2>
   <div id="cache">…</div>
 </section>
 
@@ -118,21 +121,28 @@ async function refresh() {
     const c = s.control;
     if (c) {
       document.getElementById('curmode').textContent =
-        `${c.mode}（A=${c.ip}，延迟=${c.delay_seconds}s，更新于 ${fmtTs(c.updated_at)}）`;
+        `${c.mode}（A=${c.ip}，序号=${c.serial}，延迟=${c.delay_seconds}s，` +
+        `更新于 ${fmtTs(c.updated_at)}）`;
       document.querySelector(`input[name=mode][value=${c.mode}]`).checked = true;
       if (document.activeElement.id !== 'ip') document.getElementById('ip').value = c.ip;
+      if (document.activeElement.id !== 'serial')
+        document.getElementById('serial').value = c.serial;
       if (document.activeElement.id !== 'delay')
         document.getElementById('delay').value = c.delay_seconds;
     }
     const k = s.cache;
-    document.getElementById('cache').innerHTML = k ?
+    document.getElementById('cache').innerHTML = (k ?
       `<span class="pill">rcode=${k.rcode}</span>` +
       (k.a_record ? `<span class="pill">A=${k.a_record}</span>` : '<span class="pill">无 A 记录</span>') +
+      `<span class="pill">缓存序号=${k.serial}</span>` +
       `<span class="pill">fresh: ${countdown(k.fresh_until)}</span>` +
       (k.stale_until ? `<span class="pill">stale: ${countdown(k.stale_until)}</span>`
                      : '<span class="pill">无 stale 备用</span>') +
       (k.nx_confirmed_at ? `<span class="pill">NXDOMAIN 确认于 ${fmtTs(k.nx_confirmed_at)}</span>` : '')
-      : '<span class="muted">（缓存为空）</span>';
+      : '<span class="muted">（缓存为空）</span>') +
+      (s.replica ? `<div class="muted" style="margin-top:.4rem">已接受最高序号：` +
+        `<b>${s.replica.serial}</b>（结果 ${s.replica.rcode}` +
+        (s.replica.a_record ? ` / A=${s.replica.a_record}` : '') + `）</div>` : '');
     fillLog('rlog', s.resolver_log, r =>
       [fmtTs(r.ts), r.qname, r.qtype, r.source, r.rcode, r.answers, r.detail]);
     fillLog('alog', s.auth_log, r =>
@@ -149,6 +159,7 @@ function fillLog(id, rows, cols) {
 async function applyMode() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const body = { mode, ip: document.getElementById('ip').value,
+                 serial: parseInt(document.getElementById('serial').value, 10),
                  delay_seconds: parseFloat(document.getElementById('delay').value) };
   const r = await (await fetch('/api/mode', { method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })).json();
@@ -165,8 +176,11 @@ async function doQuery() {
   const ans = r.answers.length
     ? r.answers.map(a => `${a.type} ${a.data} <span class="muted">TTL=${a.ttl}s</span>`).join('，')
     : '（无应答记录）';
+  const serial = (r.serial === null || r.serial === undefined)
+    ? '<span class="pill">序号：无</span>'
+    : `<span class="pill">序号：<b>${r.serial}</b></span>`;
   el.innerHTML = `<p><b>${r.rcode}</b> &nbsp; ${ans} &nbsp; ` +
-    `<span class="pill">来源：${r.source}</span> ` +
+    `<span class="pill">来源：${r.source}</span> ` + serial + ` ` +
     `<span class="muted">${r.elapsed_ms}ms · ${r.meta.join(' ')}</span></p>`;
   const raw = document.getElementById('qraw');
   raw.style.display = 'block';
@@ -186,6 +200,7 @@ class ModeIn(BaseModel):
     mode: str
     ip: str | None = None
     delay_seconds: float | None = None
+    serial: int | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -205,6 +220,7 @@ def state() -> dict:
         },
         "control": common.get_control(),
         "cache": common.get_cache(),
+        "replica": common.get_replica_state(),
         "resolver_log": common.recent("query_log"),
         "auth_log": common.recent("auth_log"),
     }
@@ -215,16 +231,20 @@ def set_mode(m: ModeIn):
     if m.mode not in ("a", "nxdomain", "delay", "timeout"):
         return JSONResponse({"ok": False, "error": f"unknown mode {m.mode!r}"}, 400)
     cur = common.get_control() or {"ip": common.DEFAULT_IP,
-                                   "delay_seconds": common.DEFAULT_DELAY}
+                                   "delay_seconds": common.DEFAULT_DELAY,
+                                   "serial": common.DEFAULT_SERIAL}
     ip = m.ip if m.ip is not None else cur["ip"]
     delay = m.delay_seconds if m.delay_seconds is not None else cur["delay_seconds"]
+    serial = m.serial if m.serial is not None else cur["serial"]
     try:
         ipaddress.IPv4Address(ip)
     except ValueError:
         return JSONResponse({"ok": False, "error": f"bad IPv4 address {ip!r}"}, 400)
     if not (0 <= float(delay) <= 60):
         return JSONResponse({"ok": False, "error": "delay must be 0..60s"}, 400)
-    common.set_control(m.mode, ip, float(delay))
+    if serial < 0:
+        return JSONResponse({"ok": False, "error": "serial must be >= 0"}, 400)
+    common.set_control(m.mode, ip, float(delay), int(serial))
     return {"ok": True, "control": common.get_control()}
 
 
@@ -244,16 +264,24 @@ def do_query() -> dict:
          "ttl": rr.ttl}
         for rr in rep.rr
     ]
-    txts = [str(rr.rdata).strip('"') for rr in rep.ar if rr.rtype == QTYPE.TXT]
-    source = next(
-        (t.split("=", 1)[1].split()[0] for t in txts if t.startswith("source=")),
-        "unknown",
-    )
+    txts = [str(rr.rdata).replace('"', "") for rr in rep.ar if rr.rtype == QTYPE.TXT]
+    source = "unknown"
+    serial = None
+    for t in txts:
+        for token in t.split():
+            if token.startswith("source="):
+                source = token.split("=", 1)[1]
+            elif token.startswith("serial="):
+                try:
+                    serial = int(token.split("=", 1)[1])
+                except ValueError:
+                    pass
     return {
         "ok": True,
         "rcode": RCODE[rep.header.rcode],
         "answers": answers,
         "source": source,
+        "serial": serial,
         "meta": txts,
         "elapsed_ms": int((time.time() - t0) * 1000),
         "raw": str(rep),
